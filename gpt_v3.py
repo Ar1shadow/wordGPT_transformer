@@ -18,11 +18,11 @@ block : multi-head self attention + dropout -> add & norm -> feed forward + drop
 batch_size = 32 # how many independent sequences will we process in parallel
 block_size = 256 # the maximum context length for one sequence
 N_train = 0.9   # percentage of data to use for training
-max_iters = 10000 # number of training iterations
-eval_interval = 1000  # how often to evaluate the loss on train and val sets
+max_iters = 5000 # number of training iterations
+eval_interval = 500  # how often to evaluate the loss on train and val sets
 learning_rate = 2e-3  # learning rate for optimization
 device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
-eval_iters = 200  # number of iterations to estimate the loss on train and val sets
+eval_iters = 100  # number of iterations to estimate the loss on train and val sets
 
 # transformer hyperparameters
 num_head = 6
@@ -124,10 +124,10 @@ class MultiHeadAttention(nn.Module):
         # 3 : positional encoding with RoPE
         Q_w = self.apply_rope(Q)
         K_w = self.apply_rope(K)
-        attn_weights = Q_w @ K_w.transpose(-2, -1) / math.sqrt(self.d_k) # (B, num_head,T, T) attention weights, row to col : row have how much attention to pay to col
-
+        #attn_weights = Q_w @ K_w.transpose(-2, -1) / math.sqrt(self.d_k) # (B, num_head,T, T) attention weights, row to col : row have how much attention to pay to col
+        attn_weights = F.scaled_dot_product_attention(Q_w, K_w, V, attn_mask=None, dropout_p=dropout, is_causal=True)  # (B, num_head, T, d_k) this function will handle the scaling, masking and dropout for us
         # dropout for regularization, prevent overfitting
-        attn_weights = self.dropout(attn_weights)  
+        # attn_weights = self.dropout(attn_weights)  
 
         # casual masking : mask strictly upper triangle (future tokens), keep self+past
         mask = torch.triu(torch.ones(Time_steps, Time_steps, device=device), diagonal=1).bool()  # this is a tensor, so need to specify device
@@ -264,19 +264,27 @@ if __name__ == '__main__':
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_iters)
     criiterion = nn.CrossEntropyLoss()
     history = {'train_loss': [], 'val_loss': []}
+
+    # mixed precision: only enable on CUDA; FP16 needs GradScaler to avoid underflow
+    use_amp = (device == 'cuda')
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+
     # -- training loop ---
     for steps in range(1, max_iters + 1):
         gpt.train()
         x, y = get_batch('train')
         optimizer.zero_grad(set_to_none=True)  # set_to_none=True is more efficient than zero_grad()
-        
-        logits = gpt(x)
-        loss = criiterion(logits.view(-1, logits.size(-1)), y.view(-1))
-        
-        torch.nn.utils.clip_grad_norm_(gpt.parameters(), max_norm=1.0)  # clip the gradients to prevent exploding gradients
-        
-        loss.backward()  # backpropagate the gradients
-        optimizer.step()
+
+        # forward + loss under autocast (FP16 matmul, FP32 reductions)
+        with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
+            logits = gpt(x)
+            loss = criiterion(logits.view(-1, logits.size(-1)), y.view(-1))
+
+        scaler.scale(loss).backward()  # backprop on scaled loss
+        scaler.unscale_(optimizer)     # unscale grads before clipping
+        torch.nn.utils.clip_grad_norm_(gpt.parameters(), max_norm=1.0)  # clip to prevent exploding gradients
+        scaler.step(optimizer)         # optimizer step (skips if grads are inf/nan)
+        scaler.update()                # adjust scale factor
         scheduler.step()  # update the learning rate
         
         if steps % eval_interval == 0:
