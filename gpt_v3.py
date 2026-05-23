@@ -124,18 +124,18 @@ class MultiHeadAttention(nn.Module):
         # 3 : positional encoding with RoPE
         Q_w = self.apply_rope(Q)
         K_w = self.apply_rope(K)
-        #attn_weights = Q_w @ K_w.transpose(-2, -1) / math.sqrt(self.d_k) # (B, num_head,T, T) attention weights, row to col : row have how much attention to pay to col
-        attn_weights = F.scaled_dot_product_attention(Q_w, K_w, V, attn_mask=None, dropout_p=dropout, is_causal=True)  # (B, num_head, T, d_k) this function will handle the scaling, masking and dropout for us
-        # dropout for regularization, prevent overfitting
-        # attn_weights = self.dropout(attn_weights)  
+        
+        # SDPA handles scaling + causal mask + softmax + dropout + (@V) internally,
+        # returning the attention output (B, num_head, T, d_k), NOT a score matrix.
+        # dropout_p must be 0 outside training (SDPA does not follow model.eval()).
+        out = F.scaled_dot_product_attention(
+            Q_w, K_w, V,
+            attn_mask=None,
+            dropout_p=dropout if self.training else 0.0,
+            is_causal=True,
+        )  # (B, num_head, T, d_k)
 
-        # casual masking : mask strictly upper triangle (future tokens), keep self+past
-        mask = torch.triu(torch.ones(Time_steps, Time_steps, device=device), diagonal=1).bool()  # this is a tensor, so need to specify device
-        attn_weights = attn_weights.masked_fill(mask, float('-inf'))
-        attn_weights = F.softmax(attn_weights, dim=-1)  # (B, num_head, T, T) normalize the attention weights
-        out = torch.matmul(attn_weights, V)  # (B, num_head, T, d_model) weighted sum of the values based on the attention weights
-
-         # 4 : merge heads, simple concatenation, the information between heads is not shared 
+         # 4 : merge heads, simple concatenation, the information between heads is not shared
         out = out.transpose(1, 2).contiguous().view(Batch_size, Time_steps, d_model)  # (B, T, d_model)
         
         # 5: final projection, to the original d_model dimension
